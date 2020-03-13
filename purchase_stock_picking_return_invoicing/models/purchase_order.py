@@ -1,10 +1,10 @@
-# -*- coding: utf-8 -*-
 # Copyright 2017 Eficent Business and IT Consulting Services
 # Copyright 2018 Tecnativa - Pedro M. Baeza
 # License AGPL-3.0 or later (http://www.gnu.org/licenses/agpl).
 
 import collections
 from odoo import api, fields, models
+from odoo.tools import float_compare
 
 
 class PurchaseOrder(models.Model):
@@ -15,15 +15,27 @@ class PurchaseOrder(models.Model):
         string='# of Invoice Refunds',
     )
 
-    @api.depends('order_line.qty_returned', 'order_line.qty_refunded')
+    def _check_invoice_status_to_invoice(self):
+        precision = self.env['decimal.precision'].precision_get(
+            'Product Unit of Measure'
+        )
+        return any(
+            float_compare(
+                line.qty_invoiced, line.product_qty
+                if line.product_id.purchase_method == 'purchase'
+                else line.qty_received, precision_digits=precision,
+            ) for line in self.order_line
+        )
+
     def _get_invoiced(self):
         """Modify invoice_status for taking into account returned/refunded
-        qty. It's only needed to modify the method for resetting state to
+        qty, as the comparison qty_received vs qty_invoiced can be negative.
+        It's only needed to modify the method for resetting state to
         "to invoice", as the rest of the states are already handled by super.
         """
         super(PurchaseOrder, self)._get_invoiced()
         for order in self.filtered(lambda x: x.state in ('purchase', 'done')):
-            if any(x.qty_received - x.qty_invoiced for x in order.order_line):
+            if order._check_invoice_status_to_invoice():
                 order.invoice_status = 'to invoice'
 
     @api.depends('order_line.invoice_lines.invoice_id.state')
@@ -55,8 +67,13 @@ class PurchaseOrder(models.Model):
         result = action.read()[0]
         refunds = self.invoice_ids.filtered(lambda x: x.type == 'in_refund')
         # override the context to get rid of the default filtering
-        result['context'] = {'type': 'in_refund',
-                             'default_purchase_id': self.id}
+        result['context'] = result['context'] = {
+            'type': 'in_refund',
+            'default_purchase_id': self.id,
+            'default_currency_id': self.currency_id.id,
+            'default_company_id': self.company_id.id,
+            'company_id': self.company_id.id
+        }
         if not refunds:
             # Choose a default account journal in the
             # same currency in case a new invoice is created
@@ -75,10 +92,12 @@ class PurchaseOrder(models.Model):
         # choose the view_mode accordingly
         if len(refunds) > 1:
             result['domain'] = [('id', 'in', refunds.ids)]
-        elif len(refunds) == 1:
+        else:
             res = self.env.ref('account.invoice_supplier_form', False)
             result['views'] = [(res and res.id or False, 'form')]
-            result['res_id'] = refunds.id
+            result['res_id'] = refunds.id or False
+        result['context']['default_origin'] = self.name
+        result['context']['default_reference'] = self.partner_ref
         return result
 
     @api.multi
@@ -127,6 +146,7 @@ class PurchaseOrderLine(models.Model):
     @api.depends(
         'move_ids.state',
         'move_ids.returned_move_ids.state',
+        'move_ids.product_uom_qty',
     )
     def _compute_qty_returned(self):
         """Made through read_group for not impacting in performance."""
